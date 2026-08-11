@@ -1,5 +1,12 @@
 // argentstars — shows the GitHub star count of a repository on an M5Paper
 // e-ink display, refreshing once an hour via RTC deep sleep.
+//
+// The GitHub API allows only 60 unauthenticated requests/hour PER PUBLIC IP,
+// shared by everyone behind the same NAT (an office easily exhausts it). So:
+//   1. API requests are conditional (ETag): 304 replies don't count at all.
+//   2. If the API is rate-limited anyway, the star count is scraped from the
+//      repo's public HTML page, which is not subject to the API quota.
+//   3. On failure the retry is aligned to the advertised quota-reset time.
 
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -16,7 +23,8 @@ static Preferences prefs;
 struct FetchResult {
   bool ok = false;
   long stars = -1;
-  String fetchedAt;  // local time string, already offset by TZ_OFFSET_S
+  String fetchedAt;   // local time string, already offset by TZ_OFFSET_S
+  int retryAfterS = 0;  // suggested wait when !ok (0 = use default)
 };
 
 static bool connectWifi() {
@@ -36,13 +44,18 @@ static bool connectWifi() {
   return true;
 }
 
-// "Mon, 11 Aug 2026 12:34:56 GMT" -> "2026-08-11 14:34"
-static String formatDateHeader(const String& httpDate) {
+// "Mon, 11 Aug 2026 12:34:56 GMT" -> unix epoch (0 on parse failure)
+static time_t parseDateHeader(const String& httpDate) {
   struct tm tm = {};
   if (strptime(httpDate.c_str(), "%a, %d %b %Y %H:%M:%S", &tm) == nullptr) {
-    return "";
+    return 0;
   }
-  time_t t = mktime(&tm) + TZ_OFFSET_S;
+  return mktime(&tm);  // tm is UTC and so is the device's notion of time
+}
+
+static String formatLocal(time_t utc) {
+  if (utc == 0) return "";
+  time_t t = utc + TZ_OFFSET_S;
   struct tm local;
   gmtime_r(&t, &local);
   char buf[24];
@@ -50,7 +63,8 @@ static String formatDateHeader(const String& httpDate) {
   return String(buf);
 }
 
-static FetchResult fetchStars() {
+// Primary source: GitHub REST API with a conditional (ETag) request.
+static FetchResult fetchFromApi() {
   FetchResult res;
 
   WiFiClientSecure client;
@@ -59,39 +73,160 @@ static FetchResult fetchStars() {
   HTTPClient http;
   http.setUserAgent("argentstars-m5paper");
   http.setTimeout(15000);
-  const char* headerKeys[] = {"date"};
-  http.collectHeaders(headerKeys, 1);
+  const char* headerKeys[] = {"date", "etag", "x-ratelimit-remaining",
+                              "x-ratelimit-reset"};
+  http.collectHeaders(headerKeys, 4);
 
   String url = String("https://api.github.com/repos/") + GITHUB_REPO;
   if (!http.begin(client, url)) {
-    Serial.println("http.begin failed");
+    Serial.println("api: http.begin failed");
     return res;
+  }
+#ifdef GITHUB_TOKEN
+  if (strlen(GITHUB_TOKEN) > 0) {
+    http.addHeader("Authorization", String("Bearer ") + GITHUB_TOKEN);
+  }
+#endif
+  String etag = prefs.isKey("etag") ? prefs.getString("etag", "") : String();
+  long cached = prefs.getLong("count", -1);
+  if (etag.length() && cached >= 0) {
+    http.addHeader("If-None-Match", etag);
   }
 
   int code = http.GET();
-  Serial.printf("GET %s -> %d\n", url.c_str(), code);
+  time_t now = parseDateHeader(http.header("date"));
+  Serial.printf("api: GET -> %d (ratelimit remaining=%s reset=%s)\n", code,
+                http.header("x-ratelimit-remaining").c_str(),
+                http.header("x-ratelimit-reset").c_str());
+
+  if (code == HTTP_CODE_OK) {
+    JsonDocument filter;
+    filter["stargazers_count"] = true;
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(
+        doc, http.getStream(), DeserializationOption::Filter(filter));
+    if (!err && !doc["stargazers_count"].isNull()) {
+      res.stars = doc["stargazers_count"].as<long>();
+      res.fetchedAt = formatLocal(now);
+      res.ok = true;
+      if (http.header("etag").length()) {
+        prefs.putString("etag", http.header("etag"));
+      }
+    } else {
+      Serial.printf("api: JSON parse failed: %s\n", err.c_str());
+    }
+  } else if (code == HTTP_CODE_NOT_MODIFIED) {
+    // Unchanged since last time; 304 does not count against the quota.
+    res.stars = cached;
+    res.fetchedAt = formatLocal(now);
+    res.ok = true;
+    Serial.println("api: 304 not modified, reusing cached count");
+  } else if (code == 403 || code == 429) {
+    long reset = http.header("x-ratelimit-reset").toInt();
+    if (reset > 0 && now > 0 && reset > now) {
+      res.retryAfterS = (int)(reset - now) + 60;
+      Serial.printf("api: rate limited, resets in %d s\n", res.retryAfterS);
+    }
+  }
+  http.end();
+  return res;
+}
+
+// Fallback source: scrape the repo's HTML page. Exact count appears as
+// `aria-label="1958 users starred this repository"`.
+static FetchResult fetchFromHtml() {
+  FetchResult res;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setUserAgent("Mozilla/5.0 (compatible; argentstars-m5paper)");
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  const char* headerKeys[] = {"date"};
+  http.collectHeaders(headerKeys, 1);
+
+  String url = String("https://github.com/") + GITHUB_REPO;
+  if (!http.begin(client, url)) {
+    Serial.println("html: http.begin failed");
+    return res;
+  }
+  int code = http.GET();
+  Serial.printf("html: GET -> %d\n", code);
   if (code != HTTP_CODE_OK) {
     http.end();
     return res;
   }
+  time_t now = parseDateHeader(http.header("date"));
 
-  JsonDocument filter;
-  filter["stargazers_count"] = true;
-  JsonDocument doc;
-  DeserializationError err =
-      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  if (err || doc["stargazers_count"].isNull()) {
-    Serial.printf("JSON parse failed: %s\n", err.c_str());
-    http.end();
-    return res;
+  static const char MARKER[] = " users starred this repository";
+  const size_t KEEP = sizeof(MARKER) + 16;  // window overlap: marker + digits
+  static char buf[2048 + 64];
+  size_t have = 0;
+  long found = -1;
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint32_t deadline = millis() + 25000;
+  while (http.connected() && millis() < deadline && found < 0) {
+    size_t avail = stream->available();
+    if (!avail) {
+      delay(10);
+      continue;
+    }
+    size_t space = 2048 - have;
+    int n = stream->readBytes(buf + have, avail < space ? avail : space);
+    if (n <= 0) break;
+    have += n;
+    buf[have] = '\0';
+
+    char* hit = strstr(buf, MARKER);
+    if (hit && hit > buf) {
+      // walk back over the digits preceding the marker
+      char* p = hit;
+      while (p > buf && isdigit((unsigned char)p[-1])) --p;
+      if (p < hit) found = atol(p);
+    }
+    if (found < 0 && have > KEEP) {
+      memmove(buf, buf + have - KEEP, KEEP);
+      have = KEEP;
+    }
   }
-
-  res.stars = doc["stargazers_count"].as<long>();
-  res.fetchedAt = formatDateHeader(http.header("date"));
-  res.ok = true;
   http.end();
-  Serial.printf("Stars: %ld (at %s)\n", res.stars, res.fetchedAt.c_str());
+
+  if (found >= 0) {
+    res.stars = found;
+    res.fetchedAt = formatLocal(now);
+    res.ok = true;
+    Serial.printf("html: scraped %ld stars\n", found);
+  } else {
+    Serial.println("html: marker not found in page");
+  }
   return res;
+}
+
+static FetchResult fetchStars() {
+  FetchResult api = fetchFromApi();
+  if (api.ok) return api;
+  Serial.println("api failed, trying html fallback");
+  FetchResult html = fetchFromHtml();
+  if (html.ok) return html;
+  if (api.retryAfterS > 0) html.retryAfterS = api.retryAfterS;
+  return html;
+}
+
+// Averaged reading, taken at boot BEFORE Wi-Fi/EPD load makes the battery
+// voltage sag (a single sample under load once read 49% on a full battery).
+static int readBatteryPercent() {
+  M5.Power.getBatteryLevel();  // discard first sample (ADC warm-up)
+  delay(10);
+  long sum = 0;
+  const int N = 8;
+  for (int i = 0; i < N; ++i) {
+    sum += M5.Power.getBatteryLevel();
+    delay(10);
+  }
+  return (int)(sum / N);
 }
 
 // 1,957 style thousands separator
@@ -122,7 +257,8 @@ static void drawStar(M5GFX& d, int cx, int cy, int rOuter, int color) {
   }
 }
 
-static void drawScreen(long stars, const String& updatedAt, bool stale) {
+static void drawScreen(long stars, const String& updatedAt, bool stale,
+                       int batteryPct) {
   M5GFX& d = M5.Display;
   d.setEpdMode(epd_mode_t::epd_quality);  // full refresh, no ghosting
   d.startWrite();
@@ -160,8 +296,7 @@ static void drawScreen(long stars, const String& updatedAt, bool stale) {
   if (updatedAt.length()) status = "Updated " + updatedAt;
   if (stale) status += status.length() ? "  (offline, showing last value)"
                                        : "Offline, showing last value";
-  int batt = M5.Power.getBatteryLevel();
-  if (batt >= 0) status += "   |   Battery " + String(batt) + "%";
+  if (batteryPct >= 0) status += "   |   Battery " + String(batteryPct) + "%";
   d.drawString(status, w / 2, d.height() - 32);
 
   d.endWrite();
@@ -178,6 +313,9 @@ void setup() {
     M5.Display.setRotation(M5.Display.getRotation() ^ 1);
   }
 
+  int battery = readBatteryPercent();
+  Serial.printf("Battery: %d%%\n", battery);
+
   prefs.begin("argentstars");
 
   FetchResult res;
@@ -188,19 +326,24 @@ void setup() {
   WiFi.mode(WIFI_OFF);
 
   if (res.ok) {
-    bool changed = res.stars != prefs.getLong("count", -1);
     prefs.putLong("count", res.stars);
     prefs.putString("at", res.fetchedAt);
-    // Redraw even when unchanged: refresh timestamp + battery, clears ghosting
-    (void)changed;
-    drawScreen(res.stars, res.fetchedAt, false);
+    drawScreen(res.stars, res.fetchedAt, false, battery);
   } else {
     // Keep the last known value on screen, marked as stale
-    drawScreen(prefs.getLong("count", -1), prefs.getString("at", ""), true);
+    drawScreen(prefs.getLong("count", -1), prefs.getString("at", ""), true,
+               battery);
   }
   prefs.end();
 
-  int sleepFor = res.ok ? REFRESH_INTERVAL_S : RETRY_INTERVAL_S;
+  int sleepFor;
+  if (res.ok) {
+    sleepFor = REFRESH_INTERVAL_S;
+  } else {
+    sleepFor = res.retryAfterS > 0 ? res.retryAfterS : RETRY_INTERVAL_S;
+    if (sleepFor > REFRESH_INTERVAL_S) sleepFor = REFRESH_INTERVAL_S;
+    if (sleepFor < 120) sleepFor = 120;
+  }
   Serial.printf("Sleeping for %d s\n", sleepFor);
   Serial.flush();
   // RTC-timed sleep: powers down on battery, deep-sleeps on USB

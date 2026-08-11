@@ -14,3 +14,8 @@
 
 // Offset applied to the UTC time from the API response when shown on screen
 #define TZ_OFFSET_S 7200  // UTC+2 (CEST)
+
+// Optional: GitHub personal access token for a dedicated 5000 req/h quota.
+// NOTE: only set this after enabling real TLS validation - the firmware
+// currently uses setInsecure(), which would expose the token to MITM.
+#define GITHUB_TOKEN ""
