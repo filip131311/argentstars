@@ -241,7 +241,7 @@ static String formatCount(long n) {
   return out;
 }
 
-static void drawStar(M5GFX& d, int cx, int cy, int rOuter, int color) {
+static void drawStar(LovyanGFX& d, int cx, int cy, int rOuter, int color) {
   const int points = 5;
   const float rInner = rOuter * 0.42f;
   float vx[points * 2], vy[points * 2];
@@ -257,49 +257,71 @@ static void drawStar(M5GFX& d, int cx, int cy, int rOuter, int color) {
   }
 }
 
-static void drawScreen(long stars, const String& updatedAt, bool stale,
-                       int batteryPct) {
-  M5GFX& d = M5.Display;
-  d.setEpdMode(epd_mode_t::epd_quality);  // full refresh, no ghosting
-  d.startWrite();
-  d.fillScreen(TFT_WHITE);
-  d.setTextColor(TFT_BLACK, TFT_WHITE);
+// Composes the whole frame on `g`, which is normally an off-screen canvas so
+// the panel never shows a partially drawn frame.
+static void renderFrame(LovyanGFX& g, long stars, const String& updatedAt,
+                        bool stale, int batteryPct) {
+  g.fillScreen(TFT_WHITE);
+  g.setTextColor(TFT_BLACK, TFT_WHITE);
 
-  const int w = d.width();
+  const int w = g.width();
 
-  d.setTextDatum(top_center);
-  d.setFont(&fonts::FreeSans12pt7b);
-  d.setTextSize(1);
-  d.drawString("GitHub Stars", w / 2, 48);
+  g.setTextDatum(top_center);
+  g.setFont(&fonts::FreeSans12pt7b);
+  g.setTextSize(1);
+  g.drawString("GitHub Stars", w / 2, 48);
 
-  d.setFont(&fonts::FreeSansBold18pt7b);
-  d.drawString(GITHUB_REPO, w / 2, 92);
+  g.setFont(&fonts::FreeSansBold18pt7b);
+  g.drawString(GITHUB_REPO, w / 2, 92);
 
   // Star icon + count, centered together
   String txt = stars >= 0 ? formatCount(stars) : String("--");
-  d.setFont(&fonts::FreeSansBold24pt7b);
-  d.setTextSize(4);
+  g.setFont(&fonts::FreeSansBold24pt7b);
+  g.setTextSize(4);
   const int starR = 52;
   const int gap = 40;
-  int txtW = d.textWidth(txt);
+  int txtW = g.textWidth(txt);
   int total = 2 * starR + gap + txtW;
   int x = (w - total) / 2;
   const int cy = 300;
-  drawStar(d, x + starR, cy, starR, TFT_BLACK);
-  d.setTextDatum(middle_left);
-  d.drawString(txt, x + 2 * starR + gap, cy);
+  drawStar(g, x + starR, cy, starR, TFT_BLACK);
+  g.setTextDatum(middle_left);
+  g.drawString(txt, x + 2 * starR + gap, cy);
 
-  d.setTextDatum(bottom_center);
-  d.setFont(&fonts::FreeSans12pt7b);
-  d.setTextSize(1);
+  g.setTextDatum(bottom_center);
+  g.setFont(&fonts::FreeSans12pt7b);
+  g.setTextSize(1);
   String status;
   if (updatedAt.length()) status = "Updated " + updatedAt;
   if (stale) status += status.length() ? "  (offline, showing last value)"
                                        : "Offline, showing last value";
   if (batteryPct >= 0) status += "   |   Battery " + String(batteryPct) + "%";
-  d.drawString(status, w / 2, d.height() - 32);
+  g.drawString(status, w / 2, g.height() - 32);
+}
 
-  d.endWrite();
+static void drawScreen(long stars, const String& updatedAt, bool stale,
+                       int batteryPct) {
+  M5GFX& d = M5.Display;
+  d.setEpdMode(epd_mode_t::epd_quality);  // full refresh, no ghosting
+
+  // Render everything into a PSRAM canvas first, then push the finished frame
+  // in one go: the EPD does a single refresh instead of updating while text
+  // and the star are still being composed.
+  M5Canvas canvas(&d);
+  canvas.setColorDepth(4);  // 16-level grayscale, same as the panel
+  canvas.setPsram(true);
+  if (canvas.createSprite(d.width(), d.height())) {
+    renderFrame(canvas, stars, updatedAt, stale, batteryPct);
+    d.startWrite();
+    canvas.pushSprite(0, 0);
+    d.endWrite();
+    canvas.deleteSprite();
+  } else {
+    // No memory for a full frame: draw straight to the display
+    d.startWrite();
+    renderFrame(d, stars, updatedAt, stale, batteryPct);
+    d.endWrite();
+  }
   d.waitDisplay();
 }
 
