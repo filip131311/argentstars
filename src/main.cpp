@@ -287,12 +287,31 @@ static const gpio_num_t BTN_PINS[] = {BTN_PREV, BTN_PUSH, BTN_NEXT};
 
 enum Button { BTN_NONE, BTN_PREV_PRESSED, BTN_NEXT_PRESSED, BTN_PUSH_PRESSED };
 
-// Which wheel position is being held right after the wake-up.
+// Which wheel position is being held.
 static Button readButton() {
   if (digitalRead(BTN_PREV) == LOW) return BTN_PREV_PRESSED;
   if (digitalRead(BTN_NEXT) == LOW) return BTN_NEXT_PRESSED;
   if (digitalRead(BTN_PUSH) == LOW) return BTN_PUSH_PRESSED;
   return BTN_NONE;
+}
+
+// Button that caused the last wake-up, captured right after the sleep
+// returns — before the e-paper re-init, which takes long enough for a
+// normal press to be released.
+static Button wakeButton = BTN_NONE;
+
+// Samples the wheel for a short while; a tilt (prev/next) wins over push,
+// which the wheel can briefly brush on its way.
+static Button captureButton() {
+  Button best = BTN_NONE;
+  uint32_t start = millis();
+  while (millis() - start < 80) {
+    Button b = readButton();
+    if (b == BTN_PREV_PRESSED || b == BTN_NEXT_PRESSED) return b;
+    if (b != BTN_NONE) best = b;
+    delay(5);
+  }
+  return best;
 }
 
 // 1,957 style thousands separator
@@ -520,6 +539,7 @@ static esp_sleep_wakeup_cause_t sleepFor(int seconds) {
   esp_sleep_enable_gpio_wakeup();
   M5.Power.lightSleep((uint64_t)seconds * 1000000ULL, /*touch_wakeup=*/false);
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  wakeButton = (cause == ESP_SLEEP_WAKEUP_GPIO) ? captureButton() : BTN_NONE;
   for (gpio_num_t pin : BTN_PINS) gpio_wakeup_disable(pin);
   M5.Display.wakeup();
   return cause;
@@ -528,7 +548,7 @@ static esp_sleep_wakeup_cause_t sleepFor(int seconds) {
 // One wake-up: handle the wheel, refresh/draw the current screen, return
 // how long to sleep.
 static int handleWake(esp_sleep_wakeup_cause_t cause) {
-  Button btn = (cause == ESP_SLEEP_WAKEUP_GPIO) ? readButton() : BTN_NONE;
+  Button btn = wakeButton;
   int dir = btn == BTN_NEXT_PRESSED ? +1 : btn == BTN_PREV_PRESSED ? -1 : 0;
   bool forceRefresh = (btn == BTN_PUSH_PRESSED);
   Serial.printf("Wake cause: %d, button: %s\n", (int)cause,
