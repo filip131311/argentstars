@@ -458,26 +458,19 @@ static void countdownRender(LovyanGFX& g, const Context& ctx) {
   g.setTextSize(2);
   g.drawString(COUNTDOWN_LABEL, w / 2, 60);
 
-  String big, unit;
+  String big;
   if (ctx.now == 0) {
     big = "--";
-    unit = "brak zegara";
   } else {
     long days = daysUntil(ctx.now, TZ_OFFSET_S, COUNTDOWN_YEAR, COUNTDOWN_MONTH,
                           COUNTDOWN_DAY);
     if (days < 0) days = 0;
     big = String(days);
-    unit = days == 1 ? "dzień" : "dni";
   }
   g.setFont(&fonts::FreeSansBold24pt7b);
   g.setTextSize(5);
   g.setTextDatum(middle_center);
-  g.drawString(big, w / 2, 290);
-
-  g.setFont(&fonts::efontJA_24);
-  g.setTextSize(2);
-  g.setTextDatum(top_center);
-  g.drawString(unit, w / 2, 390);
+  g.drawString(big, w / 2, 310);
 
   String status;
   if (ctx.now) status = "Dzisiaj " + formatLocal(ctx.now, "%Y-%m-%d");
