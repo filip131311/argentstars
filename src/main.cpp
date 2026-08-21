@@ -1,6 +1,7 @@
 // argentstars — M5Paper e-ink dashboard with several screens (side wheel switches them):
 //   0. GitHub star count of a repository (refreshed hourly)
 //   1. Countdown of days until a target date (refreshed at local midnight)
+//   2. Static "AI-Native Company / Software Mansion" card
 //
 // Between refreshes the device light-sleeps (the program stays resident; a
 // deep-sleep reboot on this hardware browns out intermittently during the
@@ -361,6 +362,7 @@ struct Screen {
   int (*refresh)(Context& ctx);
   void (*render)(LovyanGFX& g, const Context& ctx);
 };
+static const int SCREEN_COUNT = 3;  // must match SCREENS[] below
 
 static void drawFooter(LovyanGFX& g, const String& status, int screenIdx,
                        int screenCount) {
@@ -429,7 +431,7 @@ static void starsRender(LovyanGFX& g, const Context& ctx) {
   if (ctx.stale) status += status.length() ? "  (offline, showing last value)"
                                            : "Offline, showing last value";
   status += batteryStatus("Battery", ctx.battery);
-  drawFooter(g, status, 0, 2);
+  drawFooter(g, status, 0, SCREEN_COUNT);
 }
 
 // --- Screen 1: countdown ----------------------------------------------------
@@ -476,14 +478,68 @@ static void countdownRender(LovyanGFX& g, const Context& ctx) {
   if (ctx.now) status = "Dzisiaj " + formatLocal(ctx.now, "%Y-%m-%d");
   else status = "Brak synchronizacji czasu";
   status += batteryStatus("Bateria", ctx.battery);
-  drawFooter(g, status, 1, 2);
+  drawFooter(g, status, 1, SCREEN_COUNT);
+}
+
+// --- Screen 2: AI-Native Company card --------------------------------------
+
+static int cardRefresh(Context& ctx) {
+  ctx.stale = false;
+  return 24 * 3600;  // nothing to fetch; wake once a day anyway
+}
+
+// Draws `txt` centered at (cx, y) with extra spacing between letters.
+static void drawSpaced(LovyanGFX& g, const String& txt, int cx, int y,
+                       int spacing) {
+  int total = -spacing;
+  for (size_t i = 0; i < txt.length(); ++i)
+    total += g.textWidth(String(txt[i])) + spacing;
+  int x = cx - total / 2;
+  g.setTextDatum(top_left);
+  for (size_t i = 0; i < txt.length(); ++i) {
+    String ch(txt[i]);
+    g.drawString(ch, x, y);
+    x += g.textWidth(ch) + spacing;
+  }
+}
+
+static void cardRender(LovyanGFX& g, const Context& ctx) {
+  (void)ctx;
+  const int w = g.width(), h = g.height();
+
+  // Faint dot grid background
+  const int pitch = 72, dot = 6;
+  const uint32_t grey = g.color888(0xBB, 0xBB, 0xBB);
+  for (int y = pitch / 2; y < h - 40; y += pitch)
+    for (int x = pitch / 2; x < w; x += pitch)
+      g.fillRect(x - dot / 2, y - dot / 2, dot, dot, grey);
+
+  // Headline, scaled to ~88% of the panel width
+  const char* headline = "AI-Native Company";
+  g.setFont(&fonts::FreeSansBold24pt7b);
+  g.setTextSize(1);
+  float scale = 0.88f * w / g.textWidth(headline);
+  g.setTextSize(scale);
+  g.setTextDatum(middle_center);
+  const int cy = h / 2 - 30;
+  g.drawString(headline, w / 2, cy);
+  int headH = g.fontHeight();
+
+  // Letter-spaced sub line
+  g.setFont(&fonts::FreeSans9pt7b);
+  g.setTextSize(1);
+  drawSpaced(g, "SOFTWARE MANSION", w / 2, cy + headH / 2 + 12, 9);
+
+  drawFooter(g, "", 2, SCREEN_COUNT);
 }
 
 static const Screen SCREENS[] = {
     {"stars", starsRefresh, starsRender},
     {"countdown", countdownRefresh, countdownRender},
+    {"card", cardRefresh, cardRender},
 };
-static const int SCREEN_COUNT = sizeof(SCREENS) / sizeof(SCREENS[0]);
+static_assert(sizeof(SCREENS) / sizeof(SCREENS[0]) == SCREEN_COUNT,
+              "SCREEN_COUNT must match SCREENS[]");
 
 // Composes the whole frame off-screen, then pushes it in a single EPD refresh
 // so the panel never shows a partially drawn frame.
