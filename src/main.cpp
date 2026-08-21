@@ -1,12 +1,14 @@
-// argentstars — M5Paper e-ink dashboard with several swipeable screens:
+// argentstars — M5Paper e-ink dashboard with several screens (side wheel switches them):
 //   0. GitHub star count of a repository (refreshed hourly)
 //   1. Countdown of days until a target date (refreshed at local midnight)
 //
-// Between refreshes the device deep-sleeps. It wakes either from the RTC
-// timer (scheduled refresh of the screen currently shown) or from the touch
-// panel INT line (GPIO36). On a touch wake a horizontal swipe moves to the
-// next/previous screen (cyclic); the new screen then keeps its own refresh
-// cadence until the next swipe.
+// Between refreshes the device light-sleeps (the program stays resident; a
+// deep-sleep reboot on this hardware browns out intermittently during the
+// e-paper re-init and loses the wake-up cause). It wakes either from the
+// timer (scheduled refresh of the screen currently shown) or from the side
+// switch (GPIO37 = up, GPIO39 = down, GPIO38 = push). Up/down move to the
+// previous/next screen (cyclic); the new screen then keeps its own refresh
+// cadence until the next press. Push refreshes the current screen now.
 //
 // GitHub notes: the API allows only 60 unauthenticated requests/hour PER
 // PUBLIC IP, shared by everyone behind the same NAT (an office easily
@@ -23,7 +25,9 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include <time.h>
 
 #include "config.h"
@@ -275,40 +279,20 @@ static int readBatteryPercent() {
   return (int)(sum / N);
 }
 
-// Tracks the finger after a touch wake-up and classifies the movement.
-// Returns +1 (swipe left -> next screen), -1 (swipe right -> previous), 0.
-// By the time we get here the wake-up boot has consumed a few hundred ms,
-// so the finger is usually mid-swipe: we measure from where it is now.
-static int detectSwipe() {
-  const uint32_t MAX_WAIT_MS = 1500;
-  const int MIN_DISTANCE = M5.Display.width() / 10;  // ~96 px in landscape
-  uint32_t start = millis();
-  int firstX = -1, firstY = -1, lastX = -1, lastY = -1;
-  int misses = 0;
-  while (millis() - start < MAX_WAIT_MS) {
-    int16_t x, y;
-    if (M5.Display.getTouch(&x, &y)) {
-      if (firstX < 0) {
-        firstX = x;
-        firstY = y;
-      }
-      lastX = x;
-      lastY = y;
-      misses = 0;
-    } else if (firstX >= 0 && ++misses >= 3) {
-      break;  // finger released
-    }
-    delay(10);
-  }
-  if (firstX < 0) {
-    Serial.println("touch: woke up but no touch seen (gesture too quick?)");
-    return 0;
-  }
-  int dir = classifySwipe(lastX - firstX, lastY - firstY, MIN_DISTANCE);
-  Serial.printf("touch: (%d,%d)->(%d,%d) in %lu ms -> %s\n", firstX, firstY,
-                lastX, lastY, (unsigned long)(millis() - start),
-                dir > 0 ? "next" : dir < 0 ? "prev" : "tap");
-  return dir;
+// Side wheel pins (active low)
+static const gpio_num_t BTN_PREV = GPIO_NUM_37;   // wheel up
+static const gpio_num_t BTN_PUSH = GPIO_NUM_38;   // wheel push
+static const gpio_num_t BTN_NEXT = GPIO_NUM_39;   // wheel down
+static const gpio_num_t BTN_PINS[] = {BTN_PREV, BTN_PUSH, BTN_NEXT};
+
+enum Button { BTN_NONE, BTN_PREV_PRESSED, BTN_NEXT_PRESSED, BTN_PUSH_PRESSED };
+
+// Which wheel position is being held right after the wake-up.
+static Button readButton() {
+  if (digitalRead(BTN_PREV) == LOW) return BTN_PREV_PRESSED;
+  if (digitalRead(BTN_NEXT) == LOW) return BTN_NEXT_PRESSED;
+  if (digitalRead(BTN_PUSH) == LOW) return BTN_PUSH_PRESSED;
+  return BTN_NONE;
 }
 
 // 1,957 style thousands separator
@@ -522,55 +506,49 @@ static void drawScreen(const Screen& s, const Context& ctx) {
 
 static String deadlineKey(int idx) { return String("next") + idx; }
 
-static void goToSleep(int seconds) {
+// Light-sleeps until the timer fires or the side switch is pushed.
+// Returns the wake-up cause.
+static esp_sleep_wakeup_cause_t sleepFor(int seconds) {
   if (seconds < 60) seconds = 60;
-  Serial.printf("Sleeping for %d s (touch wakes early)\n", seconds);
+  Serial.printf("Sleeping for %d s (side switch wakes early)\n", seconds);
   Serial.flush();
-  // Keep the main-power hold line (GPIO2) high through deep sleep; on battery
-  // M5.Power.timerSleep() would power off instead, which would make the touch
-  // panel unable to wake us.
-  gpio_hold_en(GPIO_NUM_2);
-  gpio_deep_sleep_hold_en();
-  M5.Power.deepSleep((uint64_t)seconds * 1000000ULL, /*touch_wakeup=*/true);
+  // Wait for the wheel to be released so we don't wake immediately
+  while (readButton() != BTN_NONE) delay(10);
+  delay(50);  // debounce
+  // Light sleep can wake on any GPIO level, so all three wheel positions work
+  for (gpio_num_t pin : BTN_PINS) gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  M5.Power.lightSleep((uint64_t)seconds * 1000000ULL, /*touch_wakeup=*/false);
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  for (gpio_num_t pin : BTN_PINS) gpio_wakeup_disable(pin);
+  M5.Display.wakeup();
+  return cause;
 }
 
-void setup() {
-  gpio_hold_dis(GPIO_NUM_2);
-  auto cfg = M5.config();
-  M5.begin(cfg);
-  Serial.begin(115200);
+// One wake-up: handle the wheel, refresh/draw the current screen, return
+// how long to sleep.
+static int handleWake(esp_sleep_wakeup_cause_t cause) {
+  Button btn = (cause == ESP_SLEEP_WAKEUP_GPIO) ? readButton() : BTN_NONE;
+  int dir = btn == BTN_NEXT_PRESSED ? +1 : btn == BTN_PREV_PRESSED ? -1 : 0;
+  bool forceRefresh = (btn == BTN_PUSH_PRESSED);
+  Serial.printf("Wake cause: %d, button: %s\n", (int)cause,
+                dir > 0 ? "next" : dir < 0 ? "prev" : forceRefresh ? "push" : "none");
 
-  // Panel is portrait-native; we want landscape
-  if (M5.Display.width() < M5.Display.height()) {
-    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
-  }
-
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  bool touchWake = (cause == ESP_SLEEP_WAKEUP_EXT0);
-  Serial.printf("Wake cause: %s\n", touchWake ? "touch"
-                                    : cause == ESP_SLEEP_WAKEUP_TIMER ? "timer"
-                                                                      : "boot");
-
-  prefs.begin("argentstars");
   int screenIdx = wrapIndex(prefs.getInt("screen", 0), SCREEN_COUNT);
 #ifdef FORCE_SCREEN
-  // Test hook: `pio run -e m5paper -t upload` with
-  // PLATFORMIO_BUILD_FLAGS=-DFORCE_SCREEN=1 starts on that screen after a
-  // cold boot / reset, without needing a swipe.
-  if (!touchWake && cause != ESP_SLEEP_WAKEUP_TIMER) {
+  // Test hook: PLATFORMIO_BUILD_FLAGS=-DFORCE_SCREEN=1 pio run -t upload
+  // starts on that screen after a cold boot / reset.
+  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED && dir == 0) {
     screenIdx = wrapIndex(FORCE_SCREEN, SCREEN_COUNT);
     prefs.putInt("screen", screenIdx);
   }
 #endif
 
-  bool swiped = false;
-  if (touchWake) {
-    int dir = detectSwipe();
-    if (dir != 0) {
-      screenIdx = wrapIndex(screenIdx + dir, SCREEN_COUNT);
-      prefs.putInt("screen", screenIdx);
-      swiped = true;
-    }
+  bool switched = false;
+  if (dir != 0) {
+    screenIdx = wrapIndex(screenIdx + dir, SCREEN_COUNT);
+    prefs.putInt("screen", screenIdx);
+    switched = true;
   }
   const Screen& screen = SCREENS[screenIdx];
 
@@ -584,24 +562,40 @@ void setup() {
   // Refresh when the deadline is unknown/passed or the clock is invalid.
   long deadline = prefs.getLong(deadlineKey(screenIdx).c_str(), 0);
   bool due = (ctx.now == 0) || deadline == 0 || ctx.now >= deadline - 30;
-  if (!touchWake) due = true;  // timer wake or cold boot: always refresh
+  if (dir == 0) due = true;  // timer wake, push or cold boot: always refresh
 
-  int sleepFor;
+  int sleepS;
   if (due) {
     int interval = screen.refresh(ctx);
     if (ctx.now == 0) ctx.now = rtcNow();
     if (ctx.now) prefs.putLong(deadlineKey(screenIdx).c_str(), ctx.now + interval);
-    sleepFor = interval;
+    sleepS = interval;
     drawScreen(screen, ctx);
   } else {
-    sleepFor = (int)(deadline - ctx.now);
-    if (swiped) drawScreen(screen, ctx);
-    // else: a tap/missed gesture — the panel already shows this screen
+    sleepS = (int)(deadline - ctx.now);
+    if (switched) drawScreen(screen, ctx);
   }
-  prefs.end();
-  goToSleep(sleepFor);
+  return sleepS;
+}
+
+static esp_sleep_wakeup_cause_t lastCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+
+void setup() {
+  auto cfg = M5.config();
+  cfg.output_power = false;  // no EXT 5V boost: less load on a weak supply
+  M5.begin(cfg);
+  Serial.begin(115200);
+  Serial.printf("\nargentstars boot, reset reason %d\n", (int)esp_reset_reason());
+
+  // Panel is portrait-native; we want landscape
+  if (M5.Display.width() < M5.Display.height()) {
+    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
+  }
+  for (gpio_num_t pin : BTN_PINS) pinMode(pin, INPUT_PULLUP);
+  prefs.begin("argentstars");
 }
 
 void loop() {
-  // Never reached: deepSleep() resets on wake and setup() runs again
+  int sleepS = handleWake(lastCause);
+  lastCause = sleepFor(sleepS);
 }

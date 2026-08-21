@@ -37,13 +37,6 @@ int main() {
   CHECK(secondsToLocalMidnight(sep30_2159 + 1, TZ) == 86400);
   CHECK(secondsToLocalMidnight(aug21_10utc, TZ) == 12 * 3600);
 
-  // swipe classification
-  CHECK(classifySwipe(-200, 10, 80) == +1);
-  CHECK(classifySwipe(200, -10, 80) == -1);
-  CHECK(classifySwipe(30, 0, 80) == 0);      // too short: tap
-  CHECK(classifySwipe(100, 90, 80) == 0);    // too diagonal
-  CHECK(classifySwipe(-100, 40, 80) == +1);
-
   // wrapIndex cycles both ways
   CHECK(wrapIndex(2, 2) == 0);
   CHECK(wrapIndex(-1, 2) == 1);

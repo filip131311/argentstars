@@ -1,4 +1,4 @@
-// Pure date/gesture helpers with no Arduino dependencies so they can be
+// Pure date helpers with no Arduino dependencies so they can be
 // unit-tested on the host (see test/host_test.cpp).
 #pragma once
 
@@ -38,17 +38,6 @@ static inline long secondsToLocalMidnight(time_t nowUtc, long tzOffsetS) {
   long long sod = t % 86400;
   if (sod < 0) sod += 86400;
   return (long)(86400 - sod);
-}
-
-// Classify a touch movement as a horizontal swipe.
-// Returns +1 for a swipe to the left (finger moves towards smaller x,
-// i.e. "next page"), -1 for a swipe to the right ("previous page"),
-// 0 when it is a tap or a mostly-vertical movement.
-static inline int classifySwipe(int dx, int dy, int minDistance) {
-  int adx = dx < 0 ? -dx : dx;
-  int ady = dy < 0 ? -dy : dy;
-  if (adx < minDistance || adx < ady * 2) return 0;
-  return dx < 0 ? +1 : -1;
 }
 
 // Wrap a screen index into [0, count).

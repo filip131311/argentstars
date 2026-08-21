@@ -20,7 +20,7 @@
 // currently uses setInsecure(), which would expose the token to MITM.
 #define GITHUB_TOKEN ""
 
-// Countdown screen (swipe left/right from the stars screen): days left until
+// Countdown screen (wheel up/down from the stars screen): days left until
 // this date, shown under the label. Refreshed at local midnight.
 #define COUNTDOWN_LABEL "Dni do odejścia Kacpra:"
 #define COUNTDOWN_YEAR 2026
